@@ -228,4 +228,765 @@ From here we will continue with "Coordinate Translator for Learning Deformable M
 
 ## Part 2: Proof-of-concept implementation
 
-The next prompt should get us kickstarted with the actual implementation. If you want to see a co-created solution you can look into the ``solved.ipynb``. The  
+The next prompt should get us kickstarted with the actual implementation. If you want to see a co-created solution you can look into the ``solved.ipynb``. The snippet to read the provided data is ``
+ct_slice, seg_slice = torch.load('ct_seg_slice.pth')['ct_slice'], torch.load('ct_seg_slice.pth')['seg_slice']``. 
+
+General recommendations:
+- Users should maintain full control and understand every line.
+- Break coding into small, human-verifiable sub-steps to avoid agentic "spaghetti" repositories.
+- Prefer inline autocomplete (next edit suggestions) over massive copy-pasting.
+
+> **Suggested prompt**
+> 
+> *"I want to implement a 2D proof of concept for &quot;Coordinate Translator for Learning Deformable Medical Image Registration (im2grid, 2022)&quot; by Yihao Liu (https://github.com/yihao6/vfa/blob/main/vfa/models/im2grid.py), which is a training-free, differentiable module that matches features between fixed and moving images to output coordinate correspondences directly. Our features should be the last spatial tokens of DINOv2; assume the input is a preprocessed/normalised tensor ``ct_slice`` of size 9, 3, 301, 301 that only needs scale_factor=2 upsampling. "*
+> 
+> — **undefined**, *broad enough to leave some room for interpretation (think about more strict guiderails)*
+
+<details>
+<summary><b>ChatGPT</b></summary>
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class DINOv2CoordinateTranslator(nn.Module):
+    """
+    Training-free 2D coordinate translator.
+
+    Given fixed and moving images:
+        fixed  = [B, 3, 301, 301]
+        moving = [B, 3, 301, 301]
+
+    returns a dense correspondence grid:
+        grid = [B, 2, 301, 301]
+
+    grid[:, 0] = x-coordinate in moving image
+    grid[:, 1] = y-coordinate in moving image
+
+    Coordinates are in pixel units.
+    """
+
+    def __init__(
+        self,
+        dinov2_name="dinov2_vits14",
+        temperature=1.0,
+        upsample_factor=2,
+    ):
+        super().__init__()
+
+        self.temperature = temperature
+        self.upsample_factor = upsample_factor
+
+        # Pretrained DINOv2 backbone.
+        self.dino = torch.hub.load(
+            "facebookresearch/dinov2",
+            dinov2_name,
+        )
+
+        # This is a training-free module.
+        self.dino.eval()
+
+        for p in self.dino.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def extract_features(self, x):
+        """
+        x: [B, 3, H, W]
+
+        returns:
+            features: [B, N, D]
+            Ht, Wt: spatial token dimensions
+        """
+        out = self.dino.forward_features(x)
+
+        # Final normalized spatial/patch tokens.
+        tokens = out["x_norm_patchtokens"]
+
+        B, N, D = tokens.shape
+
+        # For ViT/14:
+        # N = (H / 14) * (W / 14)
+        Ht = x.shape[-2] // 14
+        Wt = x.shape[-1] // 14
+
+        assert Ht * Wt == N, (
+            f"Unexpected token count: N={N}, "
+            f"but expected {Ht}*{Wt}={Ht*Wt}"
+        )
+
+        return tokens, Ht, Wt
+
+    @staticmethod
+    def coordinate_grid(H, W, device, dtype):
+        """
+        Normalized coordinates in [-1, 1].
+
+        Returns:
+            [1, H*W, 2]
+        """
+        y, x = torch.meshgrid(
+            torch.linspace(-1, 1, H, device=device, dtype=dtype),
+            torch.linspace(-1, 1, W, device=device, dtype=dtype),
+            indexing="ij",
+        )
+
+        grid = torch.stack([x, y], dim=-1)
+        return grid.reshape(1, H * W, 2)
+
+    def forward(self, fixed, moving):
+        """
+        fixed, moving:
+            [B, 3, 301, 301]
+
+        returns:
+            correspondence:
+                [B, 2, 301, 301]
+
+            confidence:
+                [B, 301, 301]
+        """
+
+        B, C, H, W = fixed.shape
+
+        assert C == 3
+        assert fixed.shape == moving.shape
+
+        # ------------------------------------------------------------
+        # 1. 2x upsample
+        # ------------------------------------------------------------
+
+        fixed_up = F.interpolate(
+            fixed,
+            scale_factor=self.upsample_factor,
+            mode="bilinear",
+            align_corners=True,
+        )
+
+        moving_up = F.interpolate(
+            moving,
+            scale_factor=self.upsample_factor,
+            mode="bilinear",
+            align_corners=True,
+        )
+
+        Hu, Wu = fixed_up.shape[-2:]
+
+        # ------------------------------------------------------------
+        # 2. DINOv2 final spatial tokens
+        # ------------------------------------------------------------
+
+        fixed_tokens, Ht, Wt = self.extract_features(fixed_up)
+        moving_tokens, _, _ = self.extract_features(moving_up)
+
+        # [B, N, D]
+        assert fixed_tokens.shape == moving_tokens.shape
+
+        # ------------------------------------------------------------
+        # 3. Normalize features
+        # ------------------------------------------------------------
+
+        fixed_tokens = F.normalize(
+            fixed_tokens,
+            dim=-1,
+        )
+
+        moving_tokens = F.normalize(
+            moving_tokens,
+            dim=-1,
+        )
+
+        # ------------------------------------------------------------
+        # 4. Feature matching
+        #
+        # For every fixed token i:
+        #
+        #   p(j | i) = softmax(
+        #       <F_i, M_j> / temperature
+        #   )
+        #
+        # This is exactly the attention-style coordinate
+        # translator used by im2grid.
+        # ------------------------------------------------------------
+
+        attention = torch.matmul(
+            fixed_tokens,
+            moving_tokens.transpose(-1, -2),
+        )
+
+        attention = attention / self.temperature
+
+        attention = torch.softmax(
+            attention,
+            dim=-1,
+        )
+
+        # ------------------------------------------------------------
+        # 5. Moving-image coordinate values
+        # ------------------------------------------------------------
+
+        moving_grid = self.coordinate_grid(
+            Ht,
+            Wt,
+            device=moving_tokens.device,
+            dtype=moving_tokens.dtype,
+        )
+
+        moving_grid = moving_grid.expand(B, -1, -1)
+
+        # Expected moving coordinate for every fixed token.
+        #
+        # [B, N, N] @ [B, N, 2]
+        #       -> [B, N, 2]
+        #
+        token_correspondence = torch.matmul(
+            attention,
+            moving_grid,
+        )
+
+        # ------------------------------------------------------------
+        # 6. Convert token correspondences back to a dense image grid
+        # ------------------------------------------------------------
+
+        token_correspondence = token_correspondence.view(
+            B,
+            Ht,
+            Wt,
+            2,
+        )
+
+        # [B, Ht, Wt, 2] -> [B, 2, Ht, Wt]
+        token_correspondence = token_correspondence.permute(
+            0, 3, 1, 2,
+        )
+
+        # Upsample the sparse DINO correspondence field to the
+        # 602x602 image.
+        correspondence_up = F.interpolate(
+            token_correspondence,
+            size=(Hu, Wu),
+            mode="bilinear",
+            align_corners=True,
+        )
+
+        # ------------------------------------------------------------
+        # 7. Bring it back to original 301x301 coordinates
+        # ------------------------------------------------------------
+
+        correspondence = F.interpolate(
+            correspondence_up,
+            size=(H, W),
+            mode="bilinear",
+            align_corners=True,
+        )
+
+        # ------------------------------------------------------------
+        # 8. Confidence = maximum matching probability
+        # ------------------------------------------------------------
+
+        confidence = attention.max(dim=-1).values
+
+        confidence = confidence.view(
+            B,
+            Ht,
+            Wt,
+        )
+
+        confidence = F.interpolate(
+            confidence.unsqueeze(1),
+            size=(H, W),
+            mode="bilinear",
+            align_corners=True,
+        ).squeeze(1)
+
+        return correspondence, confidence
+```
+
+</details>
+
+<details>
+<summary><b>Qwen 3.7 Plus</b></summary>
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+class CoordinateTranslator(nn.Module):
+    """Training-free, differentiable attention-based coordinate translator."""
+    def __init__(self):
+        super().__init__()
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, query, key, value):
+        # query: (B, N, 1, C), key: (B, N, K, C), value: (B, N, K, D)
+        attention = torch.matmul(query, key.transpose(-1, -2)) # (B, N, 1, K)
+        attention = self.softmax(attention)
+        out = torch.matmul(attention, value) # (B, N, 1, D)
+        return out
+
+class PositionalEmbedding2D(nn.Module):
+    def __init__(self, num_channels, matching_channels):
+        super().__init__()
+        assert matching_channels >= 4, "matching_channels must be >= 4 for 2D cos/sin encoding"
+        self.tensor_proj = nn.Conv2d(num_channels, matching_channels, 1)
+        self.tensor_proj.weight.data.zero_()
+        self.tensor_proj.bias.data.zero_()
+        self.grid_scale = nn.Parameter(torch.ones(1))
+
+    def forward(self, x, grid):
+        x = self.tensor_proj(x)
+        x[:, :4, ...] += grid * self.grid_scale
+        return x
+
+class Im2gridDecoder2D(nn.Module):
+    def __init__(self, feature_dim=384, matching_channels=64):
+        super().__init__()
+        self.positional_embedding = PositionalEmbedding2D(num_channels=feature_dim, matching_channels=matching_channels)
+        self.coordinate_translator = CoordinateTranslator()
+
+    def get_positional_embedding(self, tensor, padding=0):
+        pads = [padding, padding] if isinstance(padding, int) else padding
+        dims = tensor.shape[2:] # H, W
+        vectors = [torch.arange(start=0-pad, end=dim+pad, device=tensor.device) for (dim, pad) in zip(dims, pads)]
+        grids = torch.meshgrid(vectors, indexing='ij')
+        grid = torch.stack(grids).unsqueeze(0).type(torch.float32)
+        
+        max_dim = max(dims)
+        grid = 2 * (grid / (max_dim - 1)) - 1.0
+        # Map each coordinate dimension to a unit vector (cos, sin)
+        grid = torch.cat((torch.cos(grid * math.pi / 2.0), torch.sin(grid * math.pi / 2.0)), dim=1)
+        return grid.repeat(tensor.shape[0], 1, 1, 1).detach()
+
+    def tensor_to_patch_token(self, x, kernel=3, stride=1):
+        # x: (B, C, H, W) -> patches: (B, C, H_out, W_out, kernel, kernel)
+        patches = x.unfold(2, kernel, stride).unfold(3, kernel, stride)
+        patches = patches.flatten(start_dim=4)          # (B, C, H_out, W_out, kernel*kernel)
+        patches = patches.flatten(start_dim=2, end_dim=3) # (B, C, H_out*W_out, kernel*kernel)
+        token = patches.permute(0, 2, 3, 1)             # (B, H_out*W_out, kernel*kernel, C)
+        return token
+
+    def separate_spatial_dim(self, x, dims):
+        if len(x.shape) == 3:
+            x = x.permute(0, 2, 1) 
+            x = x.view(x.shape[0], x.shape[1], dims[0], dims[1])
+        return x
+
+    def combine_spatial_dim(self, x):
+        if len(x.shape) == 4:
+            x = x.flatten(start_dim=2)
+            x = x.transpose(-1, -2)
+        return x
+
+    def forward(self, F, M):
+        B, C, H, W = F.shape
+        device = F.device
+        
+        # 1. Initialize identity grid normalized to [-1, 1]
+        y_coords, x_coords = torch.meshgrid(
+            torch.linspace(-1, 1, H, device=device),
+            torch.linspace(-1, 1, W, device=device),
+            indexing='ij'
+        )
+        identity_grid = torch.stack([x_coords, y_coords], dim=0).unsqueeze(0).repeat(B, 1, 1, 1)
+        
+        composed_grids = [identity_grid]
+        local_grids = []
+
+        # 2. Sample moving image features with the current composed grid
+        M_sampled = F.grid_sample(M, composed_grids[-1].permute(0, 2, 3, 1), mode='bilinear', align_corners=True)
+        
+        # 3. Prepare moving image tokens (with padding for patch extraction)
+        m_padded = F.pad(M_sampled, pad=(1, 1, 1, 1), mode='constant', value=0)
+        grid_m = self.get_positional_embedding(M_sampled, padding=1)
+        m_embedded = self.positional_embedding(m_padded, grid_m)
+        token_m = self.tensor_to_patch_token(m_embedded, kernel=3, stride=1)
+        
+        # 4. Prepare fixed image tokens
+        grid_f = self.get_positional_embedding(F, padding=0)
+        f_embedded = self.positional_embedding(F, grid_f)
+        token_f = self.combine_spatial_dim(f_embedded).unsqueeze(-2)
+        
+        # 5. Prepare coordinate grid tokens (value for attention)
+        H_pad, W_pad = H + 2, W + 2
+        y_coords_pad, x_coords_pad = torch.meshgrid(
+            torch.linspace(-1, 1, H_pad, device=device),
+            torch.linspace(-1, 1, W_pad, device=device),
+            indexing='ij'
+        )
+        grid_g = torch.stack([x_coords_pad, y_coords_pad], dim=0).unsqueeze(0).repeat(B, 1, 1, 1)
+        token_g = self.tensor_to_patch_token(grid_g, kernel=3, stride=1)
+        
+        # 6. Coordinate translation (Attention: Query=Fixed, Key=Moving, Value=Grid)
+        # token_f: (B, H*W, 1, C), token_m: (B, H*W, 9, C), token_g: (B, H*W, 9, 2)
+        token = self.coordinate_translator(token_f, token_m, token_g).squeeze(-2) # (B, H*W, 2)
+        tensor_grid = self.separate_spatial_dim(token, dims=(H, W))               # (B, 2, H, W)
+        
+        # 7. Compose grids
+        new_grid = F.grid_sample(composed_grids[-1], tensor_grid.permute(0, 2, 3, 1), mode='bilinear', align_corners=True)
+        composed_grids.append(new_grid)
+        local_grids.append(tensor_grid)
+        
+        # 8. Apply the requested scale_factor=2 upsampling to the final grid
+        upsampled_grid = F.interpolate(composed_grids[-1], scale_factor=2, mode='bilinear', align_corners=True)
+        
+        # 9. Convert grid from [-1, 1] normalized space to pixel spacing
+        dims = torch.tensor(upsampled_grid.shape[2:]).view(1, 2, 1, 1).to(device)
+        pixel_grid = (upsampled_grid + 1) / 2 * (dims - 1)
+        
+        return pixel_grid, composed_grids, local_grids
+
+class DINOv2FeatureExtractor(nn.Module):
+    def __init__(self, model_name='dinov2_vits14'):
+        super().__init__()
+        # Loads pretrained DINOv2 (downloads weights on first run)
+        self.model = torch.hub.load('facebookresearch/dinov2', model_name)
+        self.patch_size = 14
+        
+    def forward(self, x):
+        # x: (B, 3, H, W)
+        H, W = x.shape[2:]
+        
+        # DINOv2 strictly requires dimensions to be multiples of patch_size (14)
+        # Interpolate 301x301 -> 308x308 (22 * 14)
+        new_H = ((H + 13) // 14) * 14
+        new_W = ((W + 13) // 14) * 14
+        
+        if new_H != H or new_W != W:
+            x = F.interpolate(x, size=(new_H, new_W), mode='bilinear', align_corners=False)
+            
+        # Get features from the last transformer block
+        features = self.model.get_intermediate_layers(x, n=1)[0] # (B, N, D)
+        
+        # Drop the CLS token (index 0) to retain only spatial tokens
+        spatial_tokens = features[:, 1:, :] # (B, H_feat * W_feat, D)
+        
+        # Reshape to 2D spatial feature map: (B, D, H_feat, W_feat)
+        B, N, D = spatial_tokens.shape
+        h_feat = new_H // self.patch_size
+        w_feat = new_W // self.patch_size
+        spatial_tokens = spatial_tokens.permute(0, 2, 1).reshape(B, D, h_feat, w_feat)
+        
+        return spatial_tokens
+
+class Im2grid2D(nn.Module):
+    def __init__(self, feature_dim=384, matching_channels=64):
+        super().__init__()
+        # feature_dim=384 for ViT-S, 768 for ViT-B, 1024 for ViT-L, 1536 for ViT-g
+        self.feature_extractor = DINOv2FeatureExtractor(model_name='dinov2_vits14')
+        self.decoder = Im2gridDecoder2D(feature_dim=feature_dim, matching_channels=matching_channels)
+        
+    def forward(self, fixed_img, moving_img):
+        F = self.feature_extractor(fixed_img)
+        M = self.feature_extractor(moving_img)
+        pixel_grid, composed_grids, local_grids = self.decoder(F, M)
+        return pixel_grid, composed_grids, local_grids
+
+
+# ==========================================
+# Proof of Concept Usage
+# ==========================================
+if __name__ == "__main__":
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # 1. Assume input is a preprocessed/normalised tensor `ct_slice` of size 9, 3, 301, 301
+    batch_size = 9
+    ct_slice = torch.randn(batch_size, 3, 301, 301).to(device)
+    
+    # Dummy fixed image (e.g., an atlas or reference slice) of the same size
+    fixed_img = torch.randn(batch_size, 3, 301, 301).to(device)
+    
+    # 2. Initialize the model (using ViT-Small dimensions as default)
+    model = Im2grid2D(feature_dim=384, matching_channels=64).to(device)
+    model.eval()
+    
+    # 3. Forward pass (training-free, differentiable)
+    with torch.no_grad():
+        pixel_grid, composed_grids, local_grids = model(fixed_img, ct_slice)
+        
+    print(f"Input ct_slice shape:      {list(ct_slice.shape)}")
+    print(f"Output pixel_grid shape:   {list(pixel_grid.shape)} (Upsampled by 2x from feature resolution)")
+    print(f"Number of composed grids:  {len(composed_grids)}")
+    print(f"Composed grid shapes:      {[list(g.shape) for g in composed_grids]}")
+    
+    # Optional: Verify differentiability (remove no_grad to test)
+    # loss = pixel_grid.sum()
+    # loss.backward() # This will successfully backpropagate through the attention and grid sampling
+```
+End of text
+</details>
+
+<details>
+<summary><b>Gemini 3.1 Pro</b></summary>
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Im2GridCoordinateTranslator(nn.Module):
+    """
+    Training-free, differentiable Coordinate Translator (im2grid).
+    Calculates a dense correspondence grid by matching features and computing
+    a weighted sum over the moving image's spatial coordinates.
+    """
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, feat_fixed, feat_moving):
+        """
+        Args:
+            feat_fixed: Tensor of shape (B, C, H, W)
+            feat_moving: Tensor of shape (B, C, H, W)
+        Returns:
+            deformed_grid: Tensor of shape (B, H, W, 2) in range [-1, 1] 
+                           ready for F.grid_sample.
+        """
+        B, C, H, W = feat_fixed.shape
+        N = H * W
+        
+        # 1. Flatten spatial dimensions for attention matrix operations
+        # Shape becomes (B, H*W, C)
+        Q = feat_fixed.view(B, C, N).permute(0, 2, 1)  
+        K = feat_moving.view(B, C, N).permute(0, 2, 1) 
+        
+        # Optional: L2 normalization is often beneficial for DINO features 
+        # to ensure stable cosine similarities, though the original paper 
+        # utilizes standard Scaled Dot-Product scaling.
+        Q = F.normalize(Q, p=2, dim=-1)
+        K = F.normalize(K, p=2, dim=-1)
+        
+        # 2. Compute matching scores and probabilities 
+        # Using a fixed temperature for L2-normalized vectors (e.g., 0.05).
+        # If omitting L2 norm, use the paper's original scaling: temp = C ** 0.5
+        temp = 0.05
+        attn_logits = torch.bmm(Q, K.transpose(1, 2)) / temp
+        attn_probs = F.softmax(attn_logits, dim=-1) # (B, N, N)
+        
+        # 3. Construct the Identity Grid G_I (the "Values" in the attention mechanism)
+        # Coordinates range from [-1, 1] for PyTorch's F.grid_sample compatibility
+        gy, gx = torch.meshgrid(
+            torch.linspace(-1, 1, H, dtype=feat_fixed.dtype, device=feat_fixed.device),
+            torch.linspace(-1, 1, W, dtype=feat_fixed.dtype, device=feat_fixed.device),
+            indexing='ij'
+        )
+        # Stack into (H, W, 2) representing (x, y) coordinates
+        grid_identity = torch.stack([gx, gy], dim=-1) 
+        
+        # Flatten identity grid: (H*W, 2) and expand to batch size -> (B, N, 2)
+        V = grid_identity.view(1, N, 2).expand(B, -1, -1)
+        
+        # 4. Generate the expected correspondences 
+        # G = Softmax(Q * K^T) * G_I
+        G = torch.bmm(attn_probs, V)
+        
+        # Reshape back to spatial structure: (B, H, W, 2)
+        deformed_grid = G.view(B, H, W, 2)
+        
+        return deformed_grid
+
+
+class RegistrationPipelinePoC(nn.Module):
+    """
+    End-to-end wrapper bridging DINOv2 feature extraction with the im2grid module.
+    """
+    def __init__(self, dinov2_model='dinov2_vits14'):
+        super().__init__()
+        # Load DINOv2. Vit-S operates with a patch size of 14.
+        self.encoder = torch.hub.load('facebookresearch/dinov2', dinov2_model)
+        self.encoder.eval()
+        self.translator = Im2GridCoordinateTranslator()
+        
+    def extract_dinov2_spatial_tokens(self, x):
+        """
+        Upsamples the input and extracts 2D spatial features from DINOv2.
+        """
+        # Upsample 301x301 -> 602x602
+        x_up = F.interpolate(x, scale_factor=2.0, mode='bilinear', align_corners=False)
+        
+        with torch.no_grad():
+            features = self.encoder.forward_features(x_up)
+            
+        # Extract patch tokens: shape (B, N, C)
+        patch_tokens = features['x_norm_patchtokens'] 
+        B, N, C = patch_tokens.shape
+        
+        # 602 / 14 = 43. The resulting grid is 43x43
+        H_feat = x_up.shape[2] // 14
+        W_feat = x_up.shape[3] // 14
+        
+        # Reshape tokens back into a spatial 2D grid: (B, C, H, W)
+        spatial_features = patch_tokens.permute(0, 2, 1).reshape(B, C, H_feat, W_feat)
+        
+        return spatial_features
+
+    def forward(self, fixed_ct, moving_ct):
+        # 1. Extract feature grids
+        feat_fixed = self.extract_dinov2_spatial_tokens(fixed_ct)
+        feat_moving = self.extract_dinov2_spatial_tokens(moving_ct)
+        
+        # 2. Output coordinate mapping using im2grid
+        deformed_grid = self.translator(feat_fixed, feat_moving)
+        
+        return deformed_grid
+
+# ==========================================
+# Example Usage with provided specifications
+# ==========================================
+if __name__ == "__main__":
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Simulating the provided preprocessed tensor (9 slices, 3 channels, 301x301)
+    ct_slice = torch.randn(9, 3, 301, 301).to(device)
+    
+    # For a registration PoC, split the batch into a fixed target and moving sources
+    # (e.g., matching the 8 moving slices to the 1st fixed slice)
+    fixed_tensor = ct_slice[0:1].expand(8, -1, -1, -1)  # Shape: (8, 3, 301, 301)
+    moving_tensor = ct_slice[1:9]                       # Shape: (8, 3, 301, 301)
+    
+    pipeline = RegistrationPipelinePoC().to(device)
+    
+    # Predict the displacement field (deformed grid)
+    # Output shape will be (8, 43, 43, 2)
+    predicted_grid = pipeline(fixed_tensor, moving_tensor)
+    
+    print(f"Input moving tensor:  {moving_tensor.shape}")
+    print(f"Predicted coordinate grid: {predicted_grid.shape}")
+```
+
+</details>
+
+You'll notice that Qwen goes off track, does not confirm to the non-trainable part, introduces positional embeddings etc. Both Gemini and ChatGPT solve the task, yet the latter bloats up the code base immensely - making it harder to follow. Looking at the human written solved.ipynb code with only next edit suggestions, we see how much more compact it remains.  
+
+## Verify code with cross-tool prompts 
+
+General recommendations
+- Let another LLM check the code for bugs and conceptional shortcomings
+- Be aware that without strict guidance this blurs the line between your own ideas and letting the LLM do research for you
+
+> **Naive check and improve prompt**
+>
+> *Another LLM provided the following code for a proof-of-concept 2D image registration tool, could you analyse potential practical limitations and suggest improvements* 
+>
+
+Which will recommend a number of useful improvements, however, also sway to trainable solutions (diffusion regularisation loss), question DINOv2 in general and surprisingly state "But 602 is not divisible by 14.". 
+
+> **Suggested follow-up**
+> 
+> *now improve the translator with a local attention mask - ie only consider displacements of 7 voxels max. add a B-spline smoothing to reduce high frequency displacements*
+
+and 
+> *how to evaluate everything given corresponding multi-label segmentations*
+
+ChatGPT again delivers a huge amount of boiler plate code, wheras Gemini's suggestion remains readable.
+
+<details>
+<summary><b>Gemini 3.1 Pro</b></summary>
+
+```python 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Im2GridCoordinateTranslator(nn.Module):
+    """
+    Training-free, differentiable Coordinate Translator (im2grid)
+    enhanced with a local attention mask to restrict maximum displacement.
+    """
+    def __init__(self, max_displacement=7):
+        """
+        Args:
+            max_displacement: The maximum allowed displacement in feature-grid voxels.
+        """
+        super().__init__()
+        self.max_displacement = max_displacement
+        # Cache the mask if H and W remain constant to avoid recomputing it every forward pass
+        self._cached_mask = None 
+        self._cached_shape = None
+
+    def _get_local_mask(self, H, W, device):
+        """
+        Generates an (N, N) boolean mask where True indicates the distance 
+        between point i and point j is <= max_displacement.
+        """
+        if self._cached_shape == (H, W) and self._cached_mask is not None:
+            return self._cached_mask.to(device)
+
+        # 1. Create grid of integer pixel coordinates (0 to H-1, 0 to W-1)
+        y = torch.arange(H, device=device, dtype=torch.float32)
+        x = torch.arange(W, device=device, dtype=torch.float32)
+        gy, gx = torch.meshgrid(y, x, indexing='ij')
+        
+        # 2. Flatten to shape (N, 2) where N = H * W
+        coords = torch.stack([gy, gx], dim=-1).view(-1, 2)
+        
+        # 3. Compute pairwise distances
+        # Using p=float('inf') yields Chebyshev distance, ensuring the displacement 
+        # is strictly <= max_displacement on BOTH the X and Y axes independently.
+        # (For a circular radius instead of a square window, use p=2.0)
+        dist_matrix = torch.cdist(coords, coords, p=float('inf'))
+        
+        # 4. Create the boolean mask
+        mask = dist_matrix <= self.max_displacement
+        
+        self._cached_shape = (H, W)
+        self._cached_mask = mask
+        
+        return mask
+
+    def forward(self, feat_fixed, feat_moving):
+        """
+        Args:
+            feat_fixed: Tensor of shape (B, C, H, W)
+            feat_moving: Tensor of shape (B, C, H, W)
+        Returns:
+            deformed_grid: Tensor of shape (B, H, W, 2) in range [-1, 1] 
+        """
+        B, C, H, W = feat_fixed.shape
+        N = H * W
+        
+        # 1. Flatten spatial dimensions
+        Q = feat_fixed.view(B, C, N).permute(0, 2, 1)  # (B, N, C)
+        K = feat_moving.view(B, C, N).permute(0, 2, 1) # (B, N, C)
+        
+        Q = F.normalize(Q, p=2, dim=-1)
+        K = F.normalize(K, p=2, dim=-1)
+        
+        # 2. Compute matching scores
+        temp = 0.05
+        attn_logits = torch.bmm(Q, K.transpose(1, 2)) / temp # (B, N, N)
+        
+        # 3. Apply Local Attention Mask
+        mask = self._get_local_mask(H, W, attn_logits.device)
+        
+        # Broadcast mask to match batch size and fill invalid pairs with -inf
+        # The diagonal (self-matching) is always distance 0, so every row 
+        # has at least one valid entry, preventing NaN outputs from Softmax.
+        mask = mask.unsqueeze(0).expand(B, -1, -1) 
+        attn_logits = attn_logits.masked_fill(~mask, float('-inf'))
+        
+        # 4. Convert to probabilities
+        attn_probs = F.softmax(attn_logits, dim=-1) # (B, N, N)
+        
+        # 5. Construct Identity Grid 
+        gy, gx = torch.meshgrid(
+            torch.linspace(-1, 1, H, dtype=feat_fixed.dtype, device=feat_fixed.device),
+            torch.linspace(-1, 1, W, dtype=feat_fixed.dtype, device=feat_fixed.device),
+            indexing='ij'
+        )
+        grid_identity = torch.stack([gx, gy], dim=-1) # (H, W, 2)
+        
+        V = grid_identity.view(1, N, 2).expand(B, -1, -1) # (B, N, 2)
+        
+        # 6. Generate the expected correspondences
+        G = torch.bmm(attn_probs, V)
+        deformed_grid = G.view(B, H, W, 2)
+        
+        return deformed_grid
+```
+
+<\details>
+
